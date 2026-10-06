@@ -1,4 +1,5 @@
-"""SQLite layer with auto-migration and custom groups."""
+"""SQLite layer with auto-migration, groups and per-project custom fields."""
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,6 +17,7 @@ CREATE TABLE IF NOT EXISTS projects (
     cover       TEXT DEFAULT '',
     tags        TEXT DEFAULT '',
     status      TEXT DEFAULT 'active',
+    custom      TEXT DEFAULT '{}',
     favorite    INTEGER DEFAULT 0,
     position    INTEGER DEFAULT 0,
     created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -48,6 +50,8 @@ class Database:
             cols = {r[1] for r in c.execute("PRAGMA table_info(projects)").fetchall()}
             if "category" not in cols:
                 c.execute("ALTER TABLE projects ADD COLUMN category TEXT DEFAULT ''")
+            if "custom" not in cols:
+                c.execute("ALTER TABLE projects ADD COLUMN custom TEXT DEFAULT '{}'")
 
     @contextmanager
     def conn(self):
@@ -59,7 +63,7 @@ class Database:
         finally:
             c.close()
 
-    # -------------------------------------------------- projects: reads
+    # ---- projects: reads
     def list(self):
         with self.conn() as c:
             rows = c.execute(
@@ -67,19 +71,16 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def get(self, pid: int):
+    def get(self, pid):
         with self.conn() as c:
             r = c.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
         return dict(r) if r else None
 
-    def path_exists(self, path: str) -> bool:
+    def path_exists(self, path):
         with self.conn() as c:
-            return c.execute(
-                "SELECT 1 FROM projects WHERE path=?", (path,)
-            ).fetchone() is not None
+            return c.execute("SELECT 1 FROM projects WHERE path=?", (path,)).fetchone() is not None
 
     def categories(self):
-        """Distinct non-empty categories with counts."""
         with self.conn() as c:
             rows = c.execute(
                 "SELECT category, COUNT(*) AS n FROM projects "
@@ -91,11 +92,10 @@ class Database:
     def uncategorized_count(self):
         with self.conn() as c:
             return c.execute(
-                "SELECT COUNT(*) FROM projects "
-                "WHERE TRIM(COALESCE(category,'')) = ''"
+                "SELECT COUNT(*) FROM projects WHERE TRIM(COALESCE(category,'')) = ''"
             ).fetchone()[0]
 
-    def recent(self, limit: int = 8):
+    def recent(self, limit=8):
         with self.conn() as c:
             rows = c.execute(
                 "SELECT * FROM projects WHERE last_opened IS NOT NULL "
@@ -103,33 +103,47 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    # -------------------------------------------------- projects: writes
-    def create(self, **kw) -> int:
+    def get_custom(self, pid):
+        p = self.get(pid)
+        if not p:
+            return {}
+        try:
+            v = json.loads(p.get("custom") or "{}")
+            return v if isinstance(v, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    # ---- projects: writes
+    def create(self, **kw):
         with self.conn() as c:
-            pos = c.execute(
-                "SELECT COALESCE(MAX(position),0)+1 FROM projects"
-            ).fetchone()[0]
+            pos = c.execute("SELECT COALESCE(MAX(position),0)+1 FROM projects").fetchone()[0]
             cur = c.execute(
                 """INSERT INTO projects
                    (name, path, category, description, remarks, tags,
-                    status, favorite, position)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                    status, custom, favorite, position)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (kw.get("name", ""), kw.get("path", ""), kw.get("category", ""),
                  kw.get("description", ""), kw.get("remarks", ""),
                  kw.get("tags", ""), kw.get("status", "active"),
+                 json.dumps(kw.get("custom", {})),
                  int(bool(kw.get("favorite", 0))), pos),
             )
             return cur.lastrowid
 
-    def update(self, pid: int, **kw):
+    def update(self, pid, **kw):
         allowed = {"name", "path", "category", "description", "remarks",
-                   "tags", "status", "favorite", "cover"}
+                   "tags", "status", "favorite", "cover", "custom"}
         sets, vals = [], []
         for k, v in kw.items():
             if k not in allowed:
                 continue
             sets.append(f"{k}=?")
-            vals.append(int(bool(v)) if k == "favorite" else v)
+            if k == "favorite":
+                vals.append(int(bool(v)))
+            elif k == "custom":
+                vals.append(json.dumps(v) if not isinstance(v, str) else v)
+            else:
+                vals.append(v)
         if not sets:
             return
         sets.append("updated_at=CURRENT_TIMESTAMP")
@@ -137,18 +151,17 @@ class Database:
         with self.conn() as c:
             c.execute(f"UPDATE projects SET {', '.join(sets)} WHERE id=?", vals)
 
-    def delete(self, pid: int):
+    def set_custom(self, pid, data: dict):
+        self.update(pid, custom=data)
+
+    def delete(self, pid):
         with self.conn() as c:
-            row = c.execute(
-                "SELECT cover FROM projects WHERE id=?", (pid,)
-            ).fetchone()
+            row = c.execute("SELECT cover FROM projects WHERE id=?", (pid,)).fetchone()
             if row and row["cover"]:
                 f = COVERS_DIR / Path(row["cover"]).name
                 if f.exists():
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
+                    try: f.unlink()
+                    except OSError: pass
             c.execute("DELETE FROM projects WHERE id=?", (pid,))
 
     def reorder(self, ids):
@@ -156,14 +169,11 @@ class Database:
             for i, pid in enumerate(ids):
                 c.execute("UPDATE projects SET position=? WHERE id=?", (i, pid))
 
-    def touch_last_opened(self, pid: int):
+    def touch_last_opened(self, pid):
         with self.conn() as c:
-            c.execute(
-                "UPDATE projects SET last_opened=CURRENT_TIMESTAMP WHERE id=?",
-                (pid,),
-            )
+            c.execute("UPDATE projects SET last_opened=CURRENT_TIMESTAMP WHERE id=?", (pid,))
 
-    # -------------------------------------------------- groups
+    # ---- groups
     def groups_list(self):
         with self.conn() as c:
             rows = c.execute(
@@ -171,43 +181,38 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def group_create(self, name: str, color: str = "") -> int:
+    def group_create(self, name, color=""):
         name = (name or "").strip()
         if not name:
             raise ValueError("Group name is required")
         with self.conn() as c:
-            pos = c.execute(
-                "SELECT COALESCE(MAX(position),0)+1 FROM groups"
-            ).fetchone()[0]
+            pos = c.execute("SELECT COALESCE(MAX(position),0)+1 FROM groups").fetchone()[0]
             cur = c.execute(
-                "INSERT OR IGNORE INTO groups (name, color, position) "
-                "VALUES (?,?,?)", (name, color, pos),
+                "INSERT OR IGNORE INTO groups (name, color, position) VALUES (?,?,?)",
+                (name, color, pos),
             )
             return cur.lastrowid
 
-    def group_rename(self, old_name: str, new_name: str):
-        old_name = (old_name or "").strip()
-        new_name = (new_name or "").strip()
-        if not old_name or not new_name or old_name == new_name:
+    def group_rename(self, old, new):
+        old, new = (old or "").strip(), (new or "").strip()
+        if not old or not new or old == new:
             return
         with self.conn() as c:
-            c.execute("UPDATE groups SET name=? WHERE name=?", (new_name, old_name))
-            c.execute("UPDATE projects SET category=? WHERE category=?",
-                      (new_name, old_name))
+            c.execute("UPDATE groups SET name=? WHERE name=?", (new, old))
+            c.execute("UPDATE projects SET category=? WHERE category=?", (new, old))
 
-    def group_set_color(self, name: str, color: str):
+    def group_set_color(self, name, color):
         with self.conn() as c:
             c.execute("UPDATE groups SET color=? WHERE name=?", (color, name))
 
-    def group_delete(self, name: str, also_clear_projects: bool = False):
+    def group_delete(self, name, also_clear_projects=False):
         with self.conn() as c:
             c.execute("DELETE FROM groups WHERE name=?", (name,))
             if also_clear_projects:
                 c.execute("UPDATE projects SET category='' WHERE category=?", (name,))
 
-    # -------------------------------------------------- bulk
+    # ---- bulk import/export
     def replace_all(self, projects, groups):
-        """Replace projects + groups tables entirely (used by import)."""
         with self.conn() as c:
             c.execute("DELETE FROM projects")
             c.execute("DELETE FROM groups")
@@ -219,15 +224,14 @@ class Database:
             for p in projects:
                 c.execute(
                     """INSERT INTO projects
-                       (id, name, path, category, description, remarks,
-                        cover, tags, status, favorite, position,
+                       (id, name, path, category, description, remarks, cover,
+                        tags, status, custom, favorite, position,
                         created_at, updated_at, last_opened)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (p.get("id"), p.get("name", ""), p.get("path", ""),
                      p.get("category", ""), p.get("description", ""),
-                     p.get("remarks", ""), p.get("cover", ""),
-                     p.get("tags", ""), p.get("status", "active"),
+                     p.get("remarks", ""), p.get("cover", ""), p.get("tags", ""),
+                     p.get("status", "active"), p.get("custom") or "{}",
                      int(bool(p.get("favorite", 0))), p.get("position", 0),
-                     p.get("created_at"), p.get("updated_at"),
-                     p.get("last_opened")),
+                     p.get("created_at"), p.get("updated_at"), p.get("last_opened")),
                 )
