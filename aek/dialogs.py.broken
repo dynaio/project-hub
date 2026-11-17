@@ -1,0 +1,1317 @@
+"""EditDialog (with AI + sensitivity), SettingsDialog (with AI tab),
+CustomFieldDialog, StatsDialog."""
+import subprocess
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import (
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
+    QComboBox, QCompleter, QFileDialog, QMessageBox, QPushButton,
+    QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
+    QHeaderView, QColorDialog, QAbstractItemView, QProgressBar,
+    QTabWidget, QWidget, QFormLayout, QScrollArea, QFrame, QCheckBox,
+    QSpinBox, QDateTimeEdit, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView,
+)
+from PyQt6.QtCore import QDateTime
+
+from .categories import color_for, dot_icon
+from .config import SCAN_ROOTS, DEFAULT_SENSITIVE_PATTERNS
+from .scanner import find_cover, import_cover
+from .ai.client import AIClient
+from .ai.profile import (PROFILE_PATH, TEMPLATE, load_profile,
+                          save_profile, profile_exists)
+from .ai.models import fetch_models
+
+
+# ============================================================ EditDialog
+class EditDialog(QDialog):
+    def __init__(self, project=None, categories=None, settings=None,
+                 db=None, parent=None):
+        super().__init__(parent)
+        self.project = project or {}
+        self.settings = settings
+        self.db = db
+        self.cover_file = None
+        self.deleted = False
+        self._custom_widgets = {}
+        self.setWindowTitle("Edit project" if project else "New project")
+        self.setModal(True)
+        self.setMinimumWidth(640)
+        self._build(categories or [])
+
+    def _build(self, categories):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget(); v = QVBoxLayout(body)
+        v.setContentsMargins(22, 22, 22, 22); v.setSpacing(8)
+
+        v.addWidget(QLabel("Name"))
+        self.name = QLineEdit(self.project.get("name", ""))
+        v.addWidget(self.name)
+
+        v.addWidget(QLabel("Folder path"))
+        row = QHBoxLayout()
+        self.path = QLineEdit(self.project.get("path", ""))
+        browse = QPushButton("Browse…"); browse.clicked.connect(self._browse_folder)
+        row.addWidget(self.path, 1); row.addWidget(browse, 0)
+        v.addLayout(row)
+
+        v.addWidget(QLabel("Category (use / for nesting, e.g. AI/Vision)"))
+        self.category = QLineEdit(self.project.get("category", ""))
+        if categories:
+            comp = QCompleter(categories, self)
+            comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            comp.setFilterMode(Qt.MatchFlag.MatchContains)
+            self.category.setCompleter(comp)
+        v.addWidget(self.category)
+
+        v.addWidget(QLabel("Description"))
+        self.desc = QPlainTextEdit(self.project.get("description", ""))
+        self.desc.setFixedHeight(70); v.addWidget(self.desc)
+
+        v.addWidget(QLabel("Remarks / where you left off"))
+        self.remarks = QPlainTextEdit(self.project.get("remarks", ""))
+        self.remarks.setFixedHeight(70); v.addWidget(self.remarks)
+
+        meta = QHBoxLayout()
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Tags (comma separated)"))
+        self.tags = QLineEdit(self.project.get("tags", ""))
+        left.addWidget(self.tags); meta.addLayout(left, 2)
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Status"))
+        self.status = QComboBox()
+        statuses = self.settings.statuses() if self.settings else ["active"]
+        self.status.addItems(statuses)
+        cur = self.project.get("status", statuses[0] if statuses else "active")
+        if cur in statuses: self.status.setCurrentText(cur)
+        right.addWidget(self.status); meta.addLayout(right, 1)
+        v.addLayout(meta)
+
+        # ---- custom fields
+        fields = self.settings.custom_fields() if self.settings else []
+        if fields:
+            v.addSpacing(6)
+            sep = QLabel("Custom fields"); sep.setObjectName("DetailsSection")
+            v.addWidget(sep)
+            existing = self._load_custom()
+            for f in fields:
+                fname = f.get("name", ""); ftype = f.get("type","text")
+                fval = existing.get(fname, "")
+                v.addWidget(QLabel(fname))
+                if ftype == "multiline":
+                    w = QPlainTextEdit(str(fval)); w.setFixedHeight(60)
+                elif ftype == "choice":
+                    w = QComboBox(); w.addItems(f.get("options", []))
+                    if fval: w.setCurrentText(str(fval))
+                else:
+                    w = QLineEdit(str(fval))
+                    if ftype == "url": w.setPlaceholderText("https://…")
+                v.addWidget(w)
+                self._custom_widgets[fname] = (w, ftype)
+
+        # ---- AI visibility + sensitivity
+        v.addSpacing(6)
+        sep2 = QLabel("AI access & sensitivity"); sep2.setObjectName("DetailsSection")
+        v.addWidget(sep2)
+
+        self.ai_visible = QCheckBox("Allow the AI agent to read this project")
+        self.ai_visible.setChecked(bool(self.project.get("ai_visible", 0)))
+        self.ai_visible.setToolTip(
+            "Off by default. When off, the agent sees nothing from this project,\n"
+            "not even file names.")
+        v.addWidget(self.ai_visible)
+
+        self.write_allowed = QCheckBox(
+            "Allow the agent to WRITE to this project\n(only when the master write switch is on)")
+        if self.settings and self.project.get("id"):
+            self.write_allowed.setChecked(
+                self.settings.project_writes_allowed(self.project["id"]))
+        v.addWidget(self.write_allowed)
+
+        v.addWidget(QLabel("Sensitive file patterns (one per line; supports *):"))
+        self.sensitive = QPlainTextEdit()
+        self.sensitive.setFixedHeight(90)
+        if self.db and self.project.get("id"):
+            rows = self.db.sensitive_list(self.project["id"])
+            self.sensitive.setPlainText("\n".join(r["pattern"] for r in rows))
+        else:
+            self.sensitive.setPlainText("\n".join(DEFAULT_SENSITIVE_PATTERNS))
+        v.addWidget(self.sensitive)
+        hint = QLabel("These files are never sent to the agent, even if the "
+                      "project is visible.")
+        hint.setObjectName("Muted"); hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        # ---- cover
+        v.addWidget(QLabel("Cover image"))
+        cov = QHBoxLayout()
+        self.cover_lbl = QLabel("—"); self.cover_lbl.setObjectName("CoverLabel")
+        self.cover_lbl.setFixedHeight(30); cov.addWidget(self.cover_lbl, 1)
+        pick = QPushButton("Choose…"); pick.clicked.connect(self._choose_cover)
+        cov.addWidget(pick)
+        clear = QPushButton("Clear"); clear.clicked.connect(self._clear_cover)
+        cov.addWidget(clear)
+        v.addLayout(cov)
+        self._refresh_cover_label()
+
+        v.addStretch(); scroll.setWidget(body); outer.addWidget(scroll, 1)
+
+        btns = QHBoxLayout(); btns.setContentsMargins(20, 12, 20, 12)
+        if self.project.get("id"):
+            d = QPushButton("Delete"); d.setObjectName("Danger")
+            d.clicked.connect(self._delete); btns.addWidget(d)
+        btns.addStretch()
+        c = QPushButton("Cancel"); c.clicked.connect(self.reject); btns.addWidget(c)
+        s = QPushButton("Save"); s.setObjectName("Primary")
+        s.setDefault(True); s.clicked.connect(self._save); btns.addWidget(s)
+        outer.addLayout(btns)
+
+    def _load_custom(self):
+        import json
+        try:
+            v = json.loads(self.project.get("custom") or "{}")
+            return v if isinstance(v, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    def _browse_folder(self):
+        start = self.path.text() or str(SCAN_ROOTS[0])
+        if not Path(start).exists(): start = str(Path.home())
+        d = QFileDialog.getExistingDirectory(self, "Select project folder", start)
+        if d:
+            self.path.setText(d)
+            if not self.name.text().strip(): self.name.setText(Path(d).name)
+
+    def _choose_cover(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select cover image",
+                                           str(Path.home()),
+                                           "Images (*.png *.jpg *.jpeg *.webp *.gif *.bmp)")
+        if f: self.cover_file = f; self._refresh_cover_label()
+
+    def _clear_cover(self):
+        self.cover_file = "__CLEAR__"; self._refresh_cover_label()
+
+    def _refresh_cover_label(self):
+        if self.cover_file == "__CLEAR__": self.cover_lbl.setText("(will be cleared on save)")
+        elif self.cover_file: self.cover_lbl.setText(Path(self.cover_file).name)
+        elif self.project.get("cover"): self.cover_lbl.setText(Path(self.project["cover"]).name)
+        else: self.cover_lbl.setText("—")
+
+    def _save(self):
+        if not self.path.text().strip():
+            QMessageBox.warning(self, "Missing folder",
+                                "Please choose a folder for this project.")
+            return
+        self.accept()
+
+    def _delete(self):
+        ans = QMessageBox.question(
+            self, "Delete card",
+            f'Remove "{self.project.get("name")}" from the hub?\n\n'
+            "Your files on disk are NOT touched.")
+        if ans == QMessageBox.StandardButton.Yes:
+            self.deleted = True; self.accept()
+
+    def _collect_custom(self):
+        out = {}
+        for fname, (w, ftype) in self._custom_widgets.items():
+            if isinstance(w, QPlainTextEdit): out[fname] = w.toPlainText()
+            elif isinstance(w, QComboBox): out[fname] = w.currentText()
+            else: out[fname] = w.text()
+        return out
+
+    def values(self):
+        patterns = [ln.strip() for ln in self.sensitive.toPlainText().splitlines()
+                    if ln.strip()]
+        return {
+            "name": self.name.text().strip(),
+            "path": self.path.text().strip(),
+            "category": self.category.text().strip(),
+            "description": self.desc.toPlainText(),
+            "remarks": self.remarks.toPlainText(),
+            "tags": self.tags.text().strip(),
+            "status": self.status.currentText(),
+            "cover_file": self.cover_file,
+            "custom": self._collect_custom(),
+            "ai_visible": self.ai_visible.isChecked(),
+            "write_allowed": self.write_allowed.isChecked(),
+            "sensitive_patterns": patterns,
+        }
+
+
+# ============================================================ CustomFieldDialog
+class CustomFieldDialog(QDialog):
+    def __init__(self, field=None, parent=None):
+        super().__init__(parent)
+        self.field = field or {}
+        self.setWindowTitle("Custom field"); self.setModal(True)
+        self.setMinimumWidth(440)
+        v = QVBoxLayout(self); v.setContentsMargins(20, 20, 20, 20); v.setSpacing(8)
+
+        v.addWidget(QLabel("Name"))
+        self.name = QLineEdit(self.field.get("name", ""))
+        self.name.setPlaceholderText("e.g. Repo, Priority, Deadline")
+        v.addWidget(self.name)
+
+        v.addWidget(QLabel("Type"))
+        self.type = QComboBox(); self.type.addItems(["text","multiline","choice","url"])
+        self.type.setCurrentText(self.field.get("type", "text"))
+        v.addWidget(self.type)
+
+        v.addWidget(QLabel("Options (comma separated, used by 'choice')"))
+        self.options = QLineEdit(",".join(self.field.get("options", [])))
+        v.addWidget(self.options)
+
+        row = QHBoxLayout(); row.addStretch()
+        c = QPushButton("Cancel"); c.clicked.connect(self.reject); row.addWidget(c)
+        s = QPushButton("Save"); s.setObjectName("Primary")
+        s.setDefault(True); s.clicked.connect(self.accept); row.addWidget(s)
+        v.addLayout(row)
+
+    def value(self):
+        opts = [o.strip() for o in self.options.text().split(",") if o.strip()]
+        return {"name": self.name.text().strip(),
+                "type": self.type.currentText(), "options": opts}
+
+
+# ============================================================ ReminderDialog
+class ReminderDialog(QDialog):
+    def __init__(self, db, project_id=None, reminder=None, parent=None):
+        super().__init__(parent)
+        self.db = db; self.reminder = reminder or {}; self.project_id = project_id
+        self.setWindowTitle("Reminder"); self.setModal(True)
+        self.setMinimumWidth(460)
+        v = QVBoxLayout(self); v.setContentsMargins(20, 20, 20, 20); v.setSpacing(8)
+
+        v.addWidget(QLabel("Title"))
+        self.title = QLineEdit(self.reminder.get("title", ""))
+        self.title.setPlaceholderText("e.g. Resume MyEye calibration")
+        v.addWidget(self.title)
+
+        v.addWidget(QLabel("Message (optional)"))
+        self.message = QPlainTextEdit(self.reminder.get("message", ""))
+        self.message.setFixedHeight(70); v.addWidget(self.message)
+
+        v.addWidget(QLabel("Due date & time"))
+        self.due = QDateTimeEdit()
+        self.due.setCalendarPopup(True)
+        self.due.setDisplayFormat("yyyy-MM-dd HH:mm")
+        if self.reminder.get("due_at"):
+            self.due.setDateTime(QDateTime.fromString(
+                self.reminder["due_at"], Qt.DateFormat.ISODate))
+        else:
+            self.due.setDateTime(QDateTime.currentDateTime().addDays(7))
+        v.addWidget(self.due)
+
+        adv = QHBoxLayout()
+        adv.addWidget(QLabel("Warn this many days before:"))
+        self.advance = QSpinBox(); self.advance.setRange(0, 30)
+        self.advance.setValue(int(self.reminder.get("advance_days", 3)))
+        adv.addWidget(self.advance); adv.addStretch()
+        v.addLayout(adv)
+
+        row = QHBoxLayout()
+        if self.reminder.get("id"):
+            d = QPushButton("Delete"); d.setObjectName("Danger")
+            d.clicked.connect(self._delete); row.addWidget(d)
+        row.addStretch()
+        c = QPushButton("Cancel"); c.clicked.connect(self.reject); row.addWidget(c)
+        s = QPushButton("Save"); s.setObjectName("Primary")
+        s.setDefault(True); s.clicked.connect(self.accept); row.addWidget(s)
+        v.addLayout(row)
+
+    def _delete(self):
+        if QMessageBox.question(self, "Delete reminder",
+                                "Delete this reminder?") == QMessageBox.StandardButton.Yes:
+            self.db.reminder_delete(self.reminder["id"])
+            self.done(2)
+
+    def values(self):
+        return {
+            "title": self.title.text().strip(),
+            "message": self.message.toPlainText(),
+            "due_at": self.due.dateTime().toString(Qt.DateFormat.ISODate),
+            "advance_days": self.advance.value(),
+            "project_id": self.project_id,
+        }
+
+
+# ============================================================ AI worker
+class _AIWorker(QThread):
+    """Runs model discovery / test call off the UI thread."""
+    done  = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, settings, mode="refresh", parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.mode = mode
+
+    def run(self):
+        try:
+            from .ai.client import AIClient
+from .ai.profile import (PROFILE_PATH, TEMPLATE, load_profile,
+                          save_profile, profile_exists)
+            from .ai.models import fetch_models, build_chain, describe
+
+            key = self.settings.api_key()
+            provider = self.settings.get("ai_provider", "openrouter")
+
+            if self.mode == "refresh":
+                models = fetch_models(key, force=True)
+                self.done.emit({"mode": "refresh", "models": models})
+                return
+
+            # ---- test mode
+            client = AIClient(key, provider)
+            lines = [
+                f"Provider: {provider}",
+                f"Key source: {self.settings.key_source()}",
+                f"Key present: {'yes' if bool(key) else 'NO — set it in ~/.bashrc'}",
+                f"Max output tokens (setting): "
+                f"{self.settings.get('ai_max_output_tokens', 1024)}",
+                f"Override: {self.settings.get('ai_default_model') or '(auto)'}",
+            ]
+
+            models = fetch_models(key) if provider == "openrouter" else []
+            lines.append(f"Models discovered: {len(models)}")
+
+            chain = build_chain(key, self.settings.trust_list(),
+                                task="project_review",
+                                override=self.settings.get("ai_default_model") or None)
+            lines.append(f"Chosen chain (review profile): {chain[:4]}")
+            primary = chain[0] if chain else ""
+            lines.append(f"Primary model: {primary}")
+
+            if primary:
+                info = describe(primary)
+                ctx = info.get("context_length") or 0
+                lines.append(f"Context window: {ctx:,} tokens")
+
+            # --- rich model list: top 15 by context window
+            lines.append("")
+            lines.append("Top 15 models by context window:")
+            lines.append("  context    tools   vision  model id")
+            lines.append("  ---------- ------- ------- ------------------------------")
+            top = sorted(models, key=lambda m: -(m.get("context_length") or 0))[:15]
+            for m in top:
+                c = m.get("context_length") or 0
+                t = "yes   " if m.get("supports_tools") else "no    "
+                v = "yes   " if m.get("supports_vision") else "no    "
+                lines.append(f"  {c:>10,} {t} {v} {m.get('id','')}")
+
+            # --- trust list matches
+            lines.append("")
+            lines.append("Trust list matches (in order):")
+            matched = []
+            for pat in self.settings.trust_list():
+                pl = pat.lower()
+                for m in models:
+                    if pl in (m.get("id") or "").lower():
+                        if m["id"] not in matched:
+                            matched.append(m["id"])
+            for mid in matched[:10]:
+                lines.append(f"  {mid}")
+            if not matched:
+                lines.append("  (no matches — check Settings → AI → trust list)")
+
+            # --- the actual test call
+            lines.append("")
+            lines.append("Test call:")
+            try:
+                r = client.chat(
+                    primary or "openai/gpt-4o-mini",
+                    [{"role": "user", "content": "Reply with exactly: pong"}],
+                    temperature=0.0, max_tokens=16, timeout=30)
+                text = (r["message"].get("content") or "").strip()
+                lines += [
+                    f"  status: OK",
+                    f"  model: {primary}",
+                    f"  reply: {text[:80]}",
+                    f"  prompt tokens (in):  {r['usage']['in']}",
+                    f"  completion tokens (out): {r['usage']['out']}",
+                    f"  max_tokens requested: {r.get('max_tokens')}",
+                ]
+            except Exception as e:
+                lines += ["  status: FAIL", f"  error: {e}"]
+
+            # --- personal context summary
+            prof = load_profile()
+            lines.append("")
+            lines.append("Personal context file:")
+            lines.append(f"  path: {PROFILE_PATH}")
+            if prof.strip():
+                lines.append(f"  size: {len(prof)} chars (~{len(prof)//4} tokens)")
+                lines.append(f"  first line: {prof.strip().splitlines()[0][:60]}")
+            else:
+                lines.append("  (empty — use the button below to write one)")
+
+            self.done.emit({"mode": "test", "text": "\n".join(lines)})
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+
+# ============================================================ Personal context
+class PersonalContextDialog(QDialog):
+    """Edit ~/.aek/data/user_profile.md and settings.ai_custom_system."""
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.changed = False
+        self.setWindowTitle("Personal context")
+        self.setModal(True)
+        self.resize(820, 720)
+        self._build()
+
+    def _build(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 20, 20, 20); v.setSpacing(10)
+
+        intro = QLabel(
+            "This is what the AI knows about you before it answers. It is "
+            "loaded into every chat, review, and agent call. Write it once, "
+            "update it whenever something changes.")
+        intro.setWordWrap(True); intro.setObjectName("Muted")
+        v.addWidget(intro)
+
+        # ---- profile file
+        prof_row = QHBoxLayout()
+        prof_row.addWidget(QLabel("About me (user_profile.md)"))
+        prof_row.addStretch()
+        reset_btn = QPushButton("Reset to template")
+        reset_btn.clicked.connect(self._reset)
+        prof_row.addWidget(reset_btn)
+        copy_btn = QPushButton("Copy")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(
+            self.profile_edit.toPlainText()))
+        prof_row.addWidget(copy_btn)
+        v.addLayout(prof_row)
+
+        self.profile_edit = QPlainTextEdit()
+        self.profile_edit.setPlainText(load_profile() or TEMPLATE)
+        v.addWidget(self.profile_edit, 2)
+
+        path_lbl = QLabel(f"File: <code>{PROFILE_PATH}</code>")
+        path_lbl.setTextFormat(Qt.TextFormat.RichText)
+        path_lbl.setObjectName("Muted")
+        v.addWidget(path_lbl)
+
+        # ---- custom system instructions
+        sys_row = QHBoxLayout()
+        sys_row.addWidget(QLabel("Standing instructions (custom system prompt)"))
+        sys_row.addStretch()
+        copy_sys = QPushButton("Copy")
+        copy_sys.clicked.connect(lambda: QApplication.clipboard().setText(
+            self.custom_edit.toPlainText()))
+        sys_row.addWidget(copy_sys)
+        v.addLayout(sys_row)
+
+        self.custom_edit = QPlainTextEdit()
+        self.custom_edit.setPlainText(self.settings.get("ai_custom_system", ""))
+        self.custom_edit.setPlaceholderText(
+            "e.g.\n"
+            "- Always answer in English.\n"
+            "- Prefer concrete next steps over general advice.\n"
+            "- Never suggest paid services.")
+        v.addWidget(self.custom_edit, 1)
+
+        # ---- preview
+        v.addWidget(QLabel("Preview of the composed system prompt"))
+        self.preview = QPlainTextEdit(); self.preview.setReadOnly(True)
+        self.preview.setFixedHeight(140)
+        v.addWidget(self.preview)
+
+        def update_preview():
+            from .ai.profile import compose_system_prompt
+            from .ai.prompts import CHAT_SYSTEM
+            # a dry-run: build with a temporary save so we see the result
+            tmp_profile = self.profile_edit.toPlainText()
+            tmp_custom = self.custom_edit.toPlainText()
+            # construct by hand to avoid touching disk
+            parts = [CHAT_SYSTEM.rstrip()]
+            if tmp_profile.strip():
+                parts.append("## About the owner\n" + tmp_profile.strip())
+            if tmp_custom.strip():
+                parts.append("## Standing instructions\n" + tmp_custom.strip())
+            self.preview.setPlainText("\n\n".join(parts))
+
+        self.profile_edit.textChanged.connect(update_preview)
+        self.custom_edit.textChanged.connect(update_preview)
+        update_preview()
+
+        # ---- buttons
+        row = QHBoxLayout()
+        reset_sys = QPushButton("Clear standing instructions")
+        reset_sys.clicked.connect(lambda: self.custom_edit.setPlainText(""))
+        row.addWidget(reset_sys)
+        row.addStretch()
+        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        save = QPushButton("Save"); save.setObjectName("Primary")
+        save.clicked.connect(self._save)
+        row.addWidget(save)
+        v.addLayout(row)
+
+    def _reset(self):
+        if QMessageBox.question(
+                self, "Reset profile",
+                "Overwrite the profile with the template?\n\n"
+                "Your current text will be lost."
+                ) == QMessageBox.StandardButton.Yes:
+            self.profile_edit.setPlainText(TEMPLATE)
+
+    def _save(self):
+        save_profile(self.profile_edit.toPlainText())
+        self.settings.set("ai_custom_system", self.custom_edit.toPlainText())
+        self.changed = True
+        self.accept()
+
+
+
+# ============================================================ SettingsDialog
+class SettingsDialog(QDialog):
+    def __init__(self, db, settings, parent=None):
+        super().__init__(parent)
+        self.db = db; self.settings = settings; self.changed = False
+        self.setWindowTitle("aek settings"); self.setModal(True)
+        self.resize(680, 700)
+        self._build(); self._reload_all()
+
+    def _build(self):
+        v = QVBoxLayout(self); v.setContentsMargins(20, 20, 20, 20); v.setSpacing(10)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._tab_groups(), "Groups")
+        self.tabs.addTab(self._tab_statuses(), "Statuses")
+        self.tabs.addTab(self._tab_fields(), "Custom Fields")
+        self.tabs.addTab(self._tab_ai(), "AI")
+        self.tabs.addTab(self._tab_notifications(), "Notifications")
+        v.addWidget(self.tabs, 1)
+        row = QHBoxLayout(); row.addStretch()
+        close = QPushButton("Close"); close.clicked.connect(self.accept)
+        row.addWidget(close); v.addLayout(row)
+
+    # ---- groups (same as before)
+    def _tab_groups(self):
+        w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(10,10,10,10); v.setSpacing(8)
+        v.addWidget(QLabel("Groups are named categories. Renaming updates every project."))
+        self.group_list = QListWidget()
+        self.group_list.itemSelectionChanged.connect(self._group_on_select)
+        v.addWidget(self.group_list, 1)
+        row = QHBoxLayout()
+        self.group_input = QLineEdit(); self.group_input.setPlaceholderText("New group name")
+        row.addWidget(self.group_input, 1)
+        add = QPushButton("Add"); add.setObjectName("Primary")
+        add.clicked.connect(self._group_add); row.addWidget(add)
+        v.addLayout(row)
+        row2 = QHBoxLayout()
+        row2.addWidget(self._btn("Rename selected", self._group_rename))
+        row2.addWidget(self._btn("Change color", self._group_color))
+        row2.addStretch()
+        row2.addWidget(self._btn("Delete (keep tag)", lambda: self._group_delete(False)))
+        d2 = self._btn("Delete + untag", lambda: self._group_delete(True)); d2.setObjectName("Danger")
+        row2.addWidget(d2); v.addLayout(row2)
+        return w
+
+    def _group_reload(self):
+        self.group_list.clear()
+        used = dict(self.db.categories())
+        for g in self.db.groups_list():
+            it = QListWidgetItem(f"{g['name']}    ({used.get(g['name'], 0)})")
+            it.setData(Qt.ItemDataRole.UserRole, g["name"])
+            it.setIcon(dot_icon(g.get("color") or color_for(g["name"])))
+            self.group_list.addItem(it)
+        known = {g["name"] for g in self.db.groups_list()}
+        for name, n in self.db.categories():
+            if name in known: continue
+            it = QListWidgetItem(f"{name}    ({n})  [implicit]")
+            it.setData(Qt.ItemDataRole.UserRole, name)
+            it.setIcon(dot_icon(color_for(name)))
+            it.setForeground(QColor("#9aa6bf"))
+            self.group_list.addItem(it)
+
+    def _group_on_select(self):
+        it = self.group_list.currentItem()
+        if it: self.group_input.setText(it.data(Qt.ItemDataRole.UserRole))
+
+    def _group_add(self):
+        n = self.group_input.text().strip()
+        if not n: return
+        self.db.group_create(n, color_for(n)); self.changed = True
+        self.group_input.clear(); self._group_reload()
+
+    def _group_rename(self):
+        it = self.group_list.currentItem()
+        old = it.data(Qt.ItemDataRole.UserRole) if it else None
+        new = self.group_input.text().strip()
+        if not old or not new or old == new: return
+        self.db.group_rename(old, new); self.changed = True; self._group_reload()
+
+    def _group_color(self):
+        it = self.group_list.currentItem()
+        name = it.data(Qt.ItemDataRole.UserRole) if it else None
+        if not name: return
+        cur = next((g.get("color") or color_for(name)
+                    for g in self.db.groups_list() if g["name"] == name), color_for(name))
+        c = QColorDialog.getColor(QColor(cur), self)
+        if c.isValid():
+            self.db.group_create(name, c.name())
+            self.db.group_set_color(name, c.name())
+            self.changed = True; self._group_reload()
+
+    def _group_delete(self, clear_projects):
+        it = self.group_list.currentItem()
+        name = it.data(Qt.ItemDataRole.UserRole) if it else None
+        if not name: return
+        if QMessageBox.question(self, "Delete group",
+                                f'Delete group "{name}"?') != QMessageBox.StandardButton.Yes:
+            return
+        self.db.group_delete(name, also_clear_projects=clear_projects)
+        self.changed = True; self._group_reload()
+
+    # ---- statuses
+    def _tab_statuses(self):
+        w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(10,10,10,10); v.setSpacing(8)
+        v.addWidget(QLabel("Statuses drive the pill on cards and the 'Status' grouping."))
+        self.status_list = QListWidget()
+        self.status_list.itemSelectionChanged.connect(self._status_on_select)
+        v.addWidget(self.status_list, 1)
+        row = QHBoxLayout()
+        self.status_input = QLineEdit(); self.status_input.setPlaceholderText("New status")
+        row.addWidget(self.status_input, 1)
+        add = QPushButton("Add"); add.setObjectName("Primary")
+        add.clicked.connect(self._status_add); row.addWidget(add)
+        v.addLayout(row)
+        row2 = QHBoxLayout()
+        row2.addWidget(self._btn("Rename", self._status_rename))
+        row2.addWidget(self._btn("Move up",   lambda: self._status_move(-1)))
+        row2.addWidget(self._btn("Move down", lambda: self._status_move(1)))
+        row2.addStretch()
+        d = self._btn("Delete", self._status_delete); d.setObjectName("Danger")
+        row2.addWidget(d); v.addLayout(row2)
+        return w
+
+    def _status_reload(self):
+        self.status_list.clear()
+        for s in self.settings.statuses():
+            it = QListWidgetItem(s); it.setData(Qt.ItemDataRole.UserRole, s)
+            self.status_list.addItem(it)
+
+    def _status_on_select(self):
+        it = self.status_list.currentItem()
+        if it: self.status_input.setText(it.data(Qt.ItemDataRole.UserRole))
+
+    def _status_add(self):
+        n = self.status_input.text().strip()
+        if not n: return
+        cur = self.settings.statuses()
+        if n in cur: return
+        cur.append(n); self.settings.set_statuses(cur); self.changed = True
+        self.status_input.clear(); self._status_reload()
+
+    def _status_rename(self):
+        it = self.status_list.currentItem()
+        old = it.data(Qt.ItemDataRole.UserRole) if it else None
+        new = self.status_input.text().strip()
+        if not old or not new or old == new: return
+        cur = self.settings.statuses()
+        if new in cur: return
+        cur[cur.index(old)] = new; self.settings.set_statuses(cur)
+        with self.db.conn() as c:
+            c.execute("UPDATE projects SET status=? WHERE status=?", (new, old))
+        self.changed = True; self._status_reload()
+
+    def _status_move(self, delta):
+        it = self.status_list.currentItem()
+        if not it: return
+        name = it.data(Qt.ItemDataRole.UserRole)
+        cur = self.settings.statuses()
+        if name not in cur: return
+        i = cur.index(name); j = i + delta
+        if j < 0 or j >= len(cur): return
+        cur[i], cur[j] = cur[j], cur[i]
+        self.settings.set_statuses(cur); self.changed = True; self._status_reload()
+
+    def _status_delete(self):
+        it = self.status_list.currentItem()
+        if not it: return
+        name = it.data(Qt.ItemDataRole.UserRole)
+        if QMessageBox.question(self, "Delete status",
+                                f'Delete "{name}"? Projects fall back to "active".'
+                                ) != QMessageBox.StandardButton.Yes: return
+        cur = [s for s in self.settings.statuses() if s != name]
+        self.settings.set_statuses(cur)
+        with self.db.conn() as c:
+            c.execute("UPDATE projects SET status='active' WHERE status=?", (name,))
+        self.changed = True; self._status_reload()
+
+    # ---- custom fields
+    def _tab_fields(self):
+        w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(10,10,10,10); v.setSpacing(8)
+        v.addWidget(QLabel("Fields appear on every project's Edit form and Details view."))
+        self.field_list = QListWidget(); v.addWidget(self.field_list, 1)
+        row = QHBoxLayout()
+        row.addWidget(self._btn("Add field…", self._field_add))
+        row.addWidget(self._btn("Edit selected…", self._field_edit))
+        row.addStretch()
+        d = self._btn("Delete", self._field_delete); d.setObjectName("Danger")
+        row.addWidget(d); v.addLayout(row)
+        return w
+
+    def _field_reload(self):
+        self.field_list.clear()
+        for f in self.settings.custom_fields():
+            label = f"{f.get('name','?')}   [{f.get('type','text')}]"
+            it = QListWidgetItem(label)
+            it.setData(Qt.ItemDataRole.UserRole, f.get("name"))
+            self.field_list.addItem(it)
+
+    def _field_add(self):
+        dlg = CustomFieldDialog(parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted: return
+        v = dlg.value()
+        if not v["name"]: return
+        cur = self.settings.custom_fields()
+        if any(f.get("name") == v["name"] for f in cur):
+            QMessageBox.warning(self, "Duplicate", "Field name already exists."); return
+        cur.append(v); self.settings.set_custom_fields(cur); self.changed = True
+        self._field_reload()
+
+    def _field_edit(self):
+        it = self.field_list.currentItem()
+        if not it: return
+        name = it.data(Qt.ItemDataRole.UserRole)
+        cur = self.settings.custom_fields()
+        idx = next((i for i, f in enumerate(cur) if f.get("name") == name), None)
+        if idx is None: return
+        dlg = CustomFieldDialog(field=cur[idx], parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted: return
+        new = dlg.value()
+        if not new["name"]: return
+        if new["name"] != name:
+            import json
+            for p in self.db.list():
+                data = self.db.get_custom(p["id"])
+                if name in data:
+                    data[new["name"]] = data.pop(name)
+                    self.db.set_custom(p["id"], data)
+        cur[idx] = new; self.settings.set_custom_fields(cur); self.changed = True
+        self._field_reload()
+
+    def _field_delete(self):
+        it = self.field_list.currentItem()
+        if not it: return
+        name = it.data(Qt.ItemDataRole.UserRole)
+        if QMessageBox.question(self, "Delete field",
+                                f'Delete "{name}"?') != QMessageBox.StandardButton.Yes: return
+        cur = [f for f in self.settings.custom_fields() if f.get("name") != name]
+        self.settings.set_custom_fields(cur); self.changed = True; self._field_reload()
+
+    # ---- AI
+    def _tab_ai(self):
+        w = QWidget()
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(10,10,10,10); outer.setSpacing(8)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget(); form = QVBoxLayout(inner)
+        form.setContentsMargins(0,0,0,0); form.setSpacing(8)
+
+        # ---- key
+        key_lbl = QLabel(f"API key source:  <b>{self.settings.key_source()}</b>")
+        key_lbl.setTextFormat(Qt.TextFormat.RichText); key_lbl.setWordWrap(True)
+        form.addWidget(key_lbl)
+
+        hint = QLabel("aek reads <code>$OPENROUTER_API_KEY</code> first. "
+                      "If not set, it uses <code>~/.aek/data/openrouter_key</code>.")
+        hint.setObjectName("Muted"); hint.setWordWrap(True)
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        form.addWidget(hint)
+
+        row = QHBoxLayout()
+        self.key_input = QLineEdit(); self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_input.setPlaceholderText("sk-or-v1-…  (paste to save, empty to clear)")
+        row.addWidget(self.key_input, 1)
+        save = QPushButton("Save key file"); save.clicked.connect(self._save_key)
+        row.addWidget(save)
+        form.addLayout(row)
+
+        # ---- provider
+        self.provider = QComboBox(); self.provider.addItems(["openrouter","ollama"])
+        self.provider.setCurrentText(self.settings.get("ai_provider","openrouter"))
+        self.provider.currentTextChanged.connect(
+            lambda t: (self.settings.set("ai_provider", t),
+                       setattr(self, "changed", True)))
+        form.addWidget(QLabel("Provider")); form.addWidget(self.provider)
+
+        self.ai_enabled = QCheckBox("Enable AI features globally")
+        self.ai_enabled.setChecked(self.settings.get("ai_enabled", True))
+        self.ai_enabled.toggled.connect(
+            lambda v: (self.settings.set("ai_enabled", v),
+                       setattr(self, "changed", True)))
+        form.addWidget(self.ai_enabled)
+
+        self.write_global = QCheckBox("Master write switch — allow agent to modify files")
+        self.write_global.setChecked(self.settings.get("ai_allow_writes_global", False))
+        self.write_global.toggled.connect(
+            lambda v: (self.settings.set("ai_allow_writes_global", v),
+                       setattr(self, "changed", True)))
+        form.addWidget(self.write_global)
+
+        warn = QLabel("Writes are also gated per-project and each write is confirmed.")
+        warn.setObjectName("Muted"); warn.setWordWrap(True); form.addWidget(warn)
+
+        # ---- max output tokens
+        cap_row = QHBoxLayout()
+        cap_row.addWidget(QLabel("Max output tokens per call:"))
+        self.max_out = QSpinBox(); self.max_out.setRange(64, 65536)
+        self.max_out.setValue(int(self.settings.get("ai_max_output_tokens", 1024)))
+        self.max_out.setToolTip(
+            "Cap on how many tokens the model may produce. Lower it if "
+            "OpenRouter rejects your request with a credit error.")
+        self.max_out.valueChanged.connect(
+            lambda v: (self.settings.set("ai_max_output_tokens", int(v)),
+                       setattr(self, "changed", True)))
+        cap_row.addWidget(self.max_out); cap_row.addStretch()
+        form.addLayout(cap_row)
+
+        # ---- personal context
+        sep_pc = QLabel("Personal context"); sep_pc.setObjectName("DetailsSection")
+        form.addWidget(sep_pc)
+
+        pc_row = QHBoxLayout()
+        pc_row.addWidget(QLabel(
+            "Loaded into every AI call. Tell the model who you are."))
+        pc_row.addStretch()
+        pc_edit = QPushButton("Edit personal context…")
+        pc_edit.clicked.connect(self._open_personal_context)
+        pc_row.addWidget(pc_edit)
+        form.addLayout(pc_row)
+
+        self.pc_status = QLabel("")
+        self.pc_status.setTextFormat(Qt.TextFormat.RichText)
+        self.pc_status.setWordWrap(True)
+        form.addWidget(self.pc_status)
+        self._refresh_pc_status()
+
+        # ---- trust list
+        form.addWidget(QLabel("Model trust list (one substring per line, highest first)"))
+        self.trust = QPlainTextEdit(); self.trust.setFixedHeight(90)
+        self.trust.setPlainText("\n".join(self.settings.trust_list()))
+        form.addWidget(self.trust)
+
+        form.addWidget(QLabel("Default send mode"))
+        self.send_mode = QComboBox()
+        self.send_mode.addItems(["metadata","tree","tree+files"])
+        self.send_mode.setCurrentText(self.settings.get("ai_send_default","metadata"))
+        self.send_mode.currentTextChanged.connect(
+            lambda t: (self.settings.set("ai_send_default", t),
+                       setattr(self, "changed", True)))
+        form.addWidget(self.send_mode)
+
+        # ---- model table
+        sep = QLabel("Available models"); sep.setObjectName("DetailsSection")
+        form.addWidget(sep)
+
+        row_btn = QHBoxLayout()
+        self.refresh_btn = QPushButton("Refresh from OpenRouter")
+        self.refresh_btn.clicked.connect(self._refresh_models)
+        row_btn.addWidget(self.refresh_btn)
+        clear_ovr = QPushButton("Clear override")
+        clear_ovr.clicked.connect(self._clear_override)
+        row_btn.addWidget(clear_ovr)
+        copy_btn = QPushButton("Copy visible list")
+        copy_btn.clicked.connect(self._copy_models)
+        row_btn.addWidget(copy_btn)
+        row_btn.addStretch()
+        form.addLayout(row_btn)
+
+        self.override_lbl = QLabel(""); self.override_lbl.setTextFormat(Qt.TextFormat.RichText)
+        form.addWidget(self.override_lbl)
+
+        self.model_table = QTableWidget(0, 7)
+        self.model_table.setHorizontalHeaderLabels(
+            ["Model", "Context", "In $/M", "Out $/M", "Tools", "Vision", "Score"])
+        self.model_table.verticalHeader().setVisible(False)
+        self.model_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.model_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.model_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.model_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for i in range(1, 7):
+            self.model_table.horizontalHeader().setSectionResizeMode(
+                i, QHeaderView.ResizeMode.ResizeToContents)
+        self.model_table.setSortingEnabled(True)
+        self.model_table.doubleClicked.connect(self._set_override_from_row)
+        self.model_table.setMinimumHeight(300)
+        form.addWidget(self.model_table)
+
+        hint2 = QLabel("Double-click a row to use it for every AI call. Sort by clicking a header.")
+        hint2.setObjectName("Muted"); hint2.setWordWrap(True); form.addWidget(hint2)
+
+        # ---- test
+        sep2 = QLabel("Test connection"); sep2.setObjectName("DetailsSection")
+        form.addWidget(sep2)
+
+        self.test_btn = QPushButton("Test connection")
+        self.test_btn.clicked.connect(self._test_api)
+        form.addWidget(self.test_btn)
+
+        self.test_out = QPlainTextEdit(); self.test_out.setReadOnly(True)
+        self.test_out.setFixedHeight(180)
+        form.addWidget(self.test_out)
+
+        copy_out = QPushButton("Copy test output")
+        copy_out.clicked.connect(lambda: QApplication.clipboard().setText(
+            self.test_out.toPlainText()))
+        form.addWidget(copy_out)
+
+        scroll.setWidget(inner); outer.addWidget(scroll, 1)
+
+        self._populate_model_table()   # from cache only, no network
+        self._refresh_override_label()
+        self._ai_worker = None
+        return w
+
+    # ---- model helpers
+    def _refresh_override_label(self):
+        cur = self.settings.get("ai_default_model", "") or ""
+        if cur:
+            self.override_lbl.setText(f"<b>Active override:</b> <code>{cur}</code>")
+        else:
+            self.override_lbl.setText("<i>No override — auto-picking from trust list.</i>")
+
+    def _refresh_pc_status(self):
+        from .ai.profile import PROFILE_PATH, profile_exists, load_profile
+        if profile_exists():
+            prof = load_profile()
+            tok = len(prof) // 4
+            self.pc_status.setText(
+                f"<span style='color:#10b981'>Profile set</span>  ·  "
+                f"<code>{PROFILE_PATH}</code>  ·  ~{tok} tokens")
+        else:
+            self.pc_status.setText(
+                "<span style='color:#f59e0b'>No profile yet.</span> "
+                "Click Edit personal context to write one.")
+
+    def _open_personal_context(self):
+        dlg = PersonalContextDialog(self.settings, self)
+        dlg.exec()
+        if dlg.changed:
+            self.changed = True
+            self._refresh_pc_status()
+
+    def _populate_model_table(self, models=None):
+        if models is None:
+            try:
+                from .ai.models import _load_cache
+                models = _load_cache().get("models", [])
+            except Exception:
+                models = []
+
+        self.model_table.setSortingEnabled(False)
+        self.model_table.setRowCount(len(models))
+        for i, m in enumerate(models):
+            ctx = int(m.get("context_length") or 0)
+            inp = float(m.get("input_price") or 0) * 1_000_000
+            out = float(m.get("output_price") or 0) * 1_000_000
+            tools = "yes" if m.get("supports_tools") else ""
+            vis = "yes" if m.get("supports_vision") else ""
+            score = (ctx / 1_000_000)                     + (0.5 if m.get("supports_tools") else 0)                     - min(1.5, (inp + out) / 100)
+            self.model_table.setItem(i, 0, QTableWidgetItem(m.get("id","")))
+            self.model_table.setItem(i, 1, QTableWidgetItem(f"{ctx:,}"))
+            self.model_table.setItem(i, 2, QTableWidgetItem(f"{inp:.2f}"))
+            self.model_table.setItem(i, 3, QTableWidgetItem(f"{out:.2f}"))
+            self.model_table.setItem(i, 4, QTableWidgetItem(tools))
+            self.model_table.setItem(i, 5, QTableWidgetItem(vis))
+            self.model_table.setItem(i, 6, QTableWidgetItem(f"{score:.2f}"))
+        self.model_table.sortItems(6, Qt.SortOrder.DescendingOrder)
+        self.model_table.setSortingEnabled(True)
+
+    def _busy(self, on):
+        self.test_btn.setEnabled(not on)
+        if hasattr(self, "refresh_btn"):
+            self.refresh_btn.setEnabled(not on)
+
+    def _start_worker(self, mode):
+        if self._ai_worker and self._ai_worker.isRunning():
+            return
+        self._busy(True)
+        self._ai_worker = _AIWorker(self.settings, mode=mode, parent=self)
+        self._ai_worker.done.connect(self._on_worker_done)
+        self._ai_worker.error.connect(self._on_worker_error)
+        self._ai_worker.finished.connect(lambda: self._busy(False))
+        self._ai_worker.start()
+
+    def _on_worker_done(self, data):
+        self._busy(False)
+        if data.get("mode") == "refresh":
+            models = data.get("models", [])
+            self._populate_model_table(models)
+            self.test_out.setPlainText(f"Loaded {len(models)} models.")
+        elif data.get("mode") == "test":
+            self.test_out.setPlainText(data.get("text", ""))
+
+    def _on_worker_error(self, msg):
+        self._busy(False)
+        self.test_out.setPlainText(f"Error: {msg}")
+
+    def _refresh_models(self):
+        self.test_out.setPlainText("Refreshing model list…")
+        # persist trust/cap first
+        self.settings.set_trust_list(
+            [ln.strip() for ln in self.trust.toPlainText().splitlines() if ln.strip()])
+        self.settings.set("ai_max_output_tokens", int(self.max_out.value()))
+        self._start_worker("refresh")
+
+    def _test_api(self):
+        self.settings.set_trust_list(
+            [ln.strip() for ln in self.trust.toPlainText().splitlines() if ln.strip()])
+        self.settings.set("ai_max_output_tokens", int(self.max_out.value()))
+        self.test_out.setPlainText("Testing…")
+        self._start_worker("test")
+
+    def _set_override_from_row(self, idx):
+        item = self.model_table.item(idx.row(), 0)
+        if not item: return
+        mid = item.text()
+        self.settings.set("ai_default_model", mid)
+        self.settings.save()
+        self.changed = True
+        self._refresh_override_label()
+        self.test_out.setPlainText(f"Override set to: {mid}")
+
+    def _clear_override(self):
+        self.settings.set("ai_default_model", "")
+        self.settings.save()
+        self.changed = True
+        self._refresh_override_label()
+
+    def _copy_models(self):
+        rows = []
+        for r in range(self.model_table.rowCount()):
+            cells = [self.model_table.item(r, c).text()
+                     if self.model_table.item(r, c) else ""
+                     for c in range(self.model_table.columnCount())]
+            rows.append("\t".join(cells))
+        header = "\t".join(["Model","Context","In $/M","Out $/M","Tools","Vision","Score"])
+        QApplication.clipboard().setText(header + "\n" + "\n".join(rows))
+        self.test_out.setPlainText("Model list copied to clipboard.")
+
+    def _save_key(self):
+        k = self.key_input.text().strip()
+        if not k:
+            self.settings.set_api_key("")
+            self.test_out.setPlainText("Key file cleared. Falling back to env var.")
+        else:
+            self.settings.set_api_key(k)
+            self.test_out.setPlainText("Key saved to ~/.aek/data/openrouter_key (0600).")
+        self.key_input.clear()
+        self.changed = True
+
+    def _test_api(self):
+        self.test_out.clear()
+        self.test_btn.setEnabled(False)
+        self.changed = True
+
+        # persist trust list + send mode
+        self.settings.set_trust_list(
+            [ln.strip() for ln in self.trust.toPlainText().splitlines() if ln.strip()])
+
+        key = self.settings.api_key()
+        provider = self.settings.get("ai_provider","openrouter")
+        client = AIClient(key, provider)
+
+        lines = [f"Provider: {provider}",
+                 f"Key source: {self.settings.key_source()}",
+                 f"Key present: {'yes' if bool(key) else 'NO — set it in ~/.bashrc'}"]
+
+        try:
+            models = fetch_models(key, force=True) if provider == "openrouter" else client.models()
+            lines.append(f"Models discovered: {len(models)}")
+            from .ai.models import build_chain
+            chain = build_chain(key, self.settings.trust_list(),
+                                task="project_review")
+            lines.append(f"Chosen chain (review profile): {chain[:4]}")
+            primary = chain[0] if chain else ""
+            lines.append(f"Primary model: {primary}")
+        except Exception as e:
+            self.test_out.setPlainText("\n".join(lines + [f"Discovery failed: {e}"]))
+            self.test_btn.setEnabled(True); return
+
+        try:
+            r = client.chat(primary or "openai/gpt-4o-mini",
+                            [{"role":"user","content":"Reply with exactly: pong"}],
+                            temperature=0.0, max_tokens=8, timeout=30)
+            text = (r["message"].get("content") or "").strip()
+            lines += [
+                "",
+                "Test call:",
+                f"  status: OK",
+                f"  model echoed: {primary}",
+                f"  reply: {text[:80]}",
+                f"  tokens in/out: {r['usage']['in']}/{r['usage']['out']}",
+            ]
+            self.db.ai_log(kind="test", model=primary,
+                           prompt_preview="ping", tokens_in=r["usage"]["in"],
+                           tokens_out=r["usage"]["out"])
+        except Exception as e:
+            lines += ["", "Test call:", f"  status: FAIL",
+                      f"  error: {e}"]
+        self.test_out.setPlainText("\n".join(lines))
+        self.test_btn.setEnabled(True)
+
+    # ---- notifications
+    def _tab_notifications(self):
+        w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(10,10,10,10); v.setSpacing(8)
+        self.notif_on = QCheckBox("Enable reminder alerts")
+        self.notif_on.setChecked(self.settings.get("notifications_enabled", True))
+        self.notif_on.toggled.connect(lambda x: (self.settings.set("notifications_enabled", x),
+                                                 setattr(self, "changed", True)))
+        v.addWidget(self.notif_on)
+
+        self.notif_tray = QCheckBox("Also show system-tray notifications")
+        self.notif_tray.setChecked(self.settings.get("notifications_tray", True))
+        self.notif_tray.toggled.connect(lambda x: (self.settings.set("notifications_tray", x),
+                                                   setattr(self, "changed", True)))
+        v.addWidget(self.notif_tray)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Default advance warning (days):"))
+        self.notif_adv = QSpinBox(); self.notif_adv.setRange(0, 30)
+        self.notif_adv.setValue(int(self.settings.get("notifications_default_advance_days", 3)))
+        self.notif_adv.valueChanged.connect(
+            lambda x: (self.settings.set("notifications_default_advance_days", x),
+                       setattr(self, "changed", True)))
+        row.addWidget(self.notif_adv); row.addStretch()
+        v.addLayout(row)
+
+        v.addWidget(QLabel("Reminders rely on the aek window being open. "
+                           "The engine checks every minute."))
+        v.addStretch()
+        return w
+
+    # ---- shared
+    def _reload_all(self):
+        self._group_reload(); self._status_reload(); self._field_reload()
+
+    def _btn(self, text, slot):
+        b = QPushButton(text); b.clicked.connect(slot); return b
+
+
+# ============================================================ StatsDialog (unchanged)
+class _DuWorker(QThread):
+    one = pyqtSignal(int, int); done = pyqtSignal()
+    def __init__(self, projects):
+        super().__init__(); self.projects = projects
+    def run(self):
+        for p in self.projects:
+            path = p.get("path")
+            if not path or not Path(path).is_dir():
+                self.one.emit(p["id"], -1); continue
+            try:
+                out = subprocess.run(["du","-sb",path], capture_output=True,
+                                     text=True, timeout=120)
+                size = int(out.stdout.split()[0]) if out.stdout else -1
+            except Exception:
+                size = -1
+            self.one.emit(p["id"], size)
+        self.done.emit()
+
+
+def _human(b):
+    if b is None or b < 0: return "—"
+    units = ["B","KB","MB","GB","TB"]; f = float(b)
+    for u in units:
+        if f < 1024: return f"{f:.1f} {u}"
+        f /= 1024
+    return f"{f:.1f} PB"
+
+
+class StatsDialog(QDialog):
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Statistics"); self.setModal(True)
+        self.resize(760, 620); self._worker = None; self._sizes = {}
+        self._build(); self._populate()
+
+    def _build(self):
+        v = QVBoxLayout(self); v.setContentsMargins(20,20,20,20); v.setSpacing(12)
+        self.summary = QLabel(""); self.summary.setObjectName("StatsSummary")
+        v.addWidget(self.summary)
+        row = QHBoxLayout(); row.setSpacing(14)
+        left = QVBoxLayout(); left.addWidget(QLabel("By status"))
+        self.t_status = QTableWidget(0, 2); self._setup(self.t_status, ["Status","Projects"])
+        left.addWidget(self.t_status); row.addLayout(left, 1)
+        right = QVBoxLayout(); right.addWidget(QLabel("By category"))
+        self.t_cat = QTableWidget(0, 3); self._setup(self.t_cat, ["Category","Projects","Size"])
+        right.addWidget(self.t_cat); row.addLayout(right, 1)
+        v.addLayout(row)
+        self.progress = QProgressBar(); self.progress.setVisible(False); v.addWidget(self.progress)
+        row2 = QHBoxLayout()
+        self.calc_btn = QPushButton("Calculate disk usage")
+        self.calc_btn.clicked.connect(self._calc); row2.addWidget(self.calc_btn)
+        row2.addStretch()
+        close = QPushButton("Close"); close.clicked.connect(self.accept); row2.addWidget(close)
+        v.addLayout(row2)
+
+    def _setup(self, t, headers):
+        t.setColumnCount(len(headers)); t.setHorizontalHeaderLabels(headers)
+        t.verticalHeader().setVisible(False)
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+    def _populate(self):
+        projects = self.db.list()
+        self.summary.setText(
+            f"{len(projects)} projects  ·  "
+            f"{sum(1 for p in projects if p.get('favorite'))} favorites  ·  "
+            f"{len(self.db.categories())} categories  ·  "
+            f"{sum(1 for p in projects if p.get('ai_visible'))} AI-visible")
+        counts = {}
+        for p in projects:
+            k = p.get("status","active"); counts[k] = counts.get(k,0)+1
+        self.t_status.setRowCount(len(counts))
+        for i,(k,n) in enumerate(sorted(counts.items())):
+            self.t_status.setItem(i,0,QTableWidgetItem(k))
+            self.t_status.setItem(i,1,QTableWidgetItem(str(n)))
+        cats = dict(self.db.categories())
+        self.t_cat.setRowCount(len(cats))
+        for i,(k,n) in enumerate(sorted(cats.items(), key=lambda kv: kv[0].lower())):
+            self.t_cat.setItem(i,0,QTableWidgetItem(k))
+            self.t_cat.setItem(i,1,QTableWidgetItem(str(n)))
+            self.t_cat.setItem(i,2,QTableWidgetItem("—"))
+
+    def _calc(self):
+        projects = self.db.list()
+        if not projects: return
+        self.calc_btn.setEnabled(False); self.progress.setVisible(True)
+        self.progress.setRange(0, len(projects)); self.progress.setValue(0)
+        self._sizes = {}
+        self._worker = _DuWorker(projects)
+        self._worker.one.connect(self._on_size)
+        self._worker.done.connect(self._on_done)
+        self._worker.start()
+
+    def _on_size(self, pid, size):
+        self._sizes[pid] = size
+        self.progress.setValue(self.progress.value()+1)
+
+    def _on_done(self):
+        self.progress.setVisible(False); self.calc_btn.setEnabled(True)
+        cat_sum = {}
+        for p in self.db.list():
+            cat = (p.get("category") or "").strip()
+            if not cat: continue
+            cat_sum[cat] = cat_sum.get(cat, 0) + max(0, self._sizes.get(p["id"], 0))
+        for row in range(self.t_cat.rowCount()):
+            it = self.t_cat.item(row, 0)
+            if it: self.t_cat.setItem(row, 2, QTableWidgetItem(_human(cat_sum.get(it.text(),0))))

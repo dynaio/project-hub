@@ -18,6 +18,8 @@ class ProjectDetailsDialog(QDialog):
     edit_requested   = pyqtSignal(int)
     delete_requested = pyqtSignal(int)
     fav_toggled      = pyqtSignal(int)
+    review_requested = pyqtSignal(int)
+    ai_toggled       = pyqtSignal(int)
 
     def __init__(self, project, settings, parent=None):
         super().__init__(parent)
@@ -154,6 +156,15 @@ class ProjectDetailsDialog(QDialog):
         h.addWidget(mk("Code",        lambda: self.open_requested.emit(self.project["id"], "code")))
         h.addStretch()
 
+        self.ai_btn = QPushButton(
+            "AI access: ON" if self.project.get("ai_visible")
+            else "AI access: OFF")
+        self.ai_btn.setToolTip(
+            "Toggle whether the AI agent may read this project")
+        self.ai_btn.clicked.connect(
+            lambda: self.ai_toggled.emit(self.project["id"]))
+        h.addWidget(self.ai_btn)
+        h.addWidget(mk("AI review", lambda: self.review_requested.emit(self.project["id"]), "Primary"))
         self.fav_btn = QPushButton(
             "★ Unfavorite" if self.project.get("favorite") else "★ Favorite"
         )
@@ -186,10 +197,8 @@ class ProjectDetailsDialog(QDialog):
         fp = COVERS_DIR / Path(cov).name
         if not fp.exists():
             return None
-        pix = QPixmap(str(fp))
-        if pix.isNull():
-            return None
-        return pix.scaledToWidth(780, Qt.TransformationMode.SmoothTransformation)
+        from .widgets import _cached_cover
+        return _cached_cover(fp, 780, 220)
 
     def _get_custom(self):
         try:

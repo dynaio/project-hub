@@ -142,6 +142,48 @@ QScrollBar::handle:vertical { background: #cbd2dc; border-radius: 5px; min-heigh
 QScrollBar::handle:vertical:hover { background: #a8b2c1; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+#AIBadgeOn { background: #dcfce7; color: #166534; border-radius: 8px;
+    padding: 2px 8px; font-size: 10px; font-weight: 700; letter-spacing: .5px;
+    margin: 8px; }
+#AIBadgeOff { background: #fee2e2; color: #991b1b; border-radius: 8px;
+    padding: 2px 8px; font-size: 10px; font-weight: 700; letter-spacing: .5px;
+    margin: 8px; }
+
+#ChatPanel { background: #ffffff; }
+#ChatPanel QTextBrowser { background: #ffffff; border: 1px solid #e3e6ec;
+    border-radius: 8px; padding: 8px; }
+#ChatPanel QPlainTextEdit { background: #f5f6f8; border: 1px solid #e3e6ec;
+    border-radius: 8px; padding: 8px; }
+#ChatPanel QPlainTextEdit:focus { border-color: #3b82f6; }
+
+#FloatButton { background: #3b82f6; color: #ffffff; border-radius: 26px;
+    border: none; font-size: 16px; font-weight: 700; }
+#FloatButton:hover { background: #2563eb; }
+#FloatButton:pressed { background: #1d4ed8; }
+
+
+/* ---- status filter chips ---- */
+#StatusFilterBar { background: #ffffff; border-bottom: 1px solid #e3e6ec; }
+QPushButton#StatusChip {
+    background: #f5f6f8; border: 1px solid #e3e6ec; border-radius: 12px;
+    padding: 3px 12px; font-size: 11.5px; color: #8a92a3; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.3px;
+}
+QPushButton#StatusChip:hover { background: #eef1f6; color: #566072; }
+QPushButton#StatusChip:checked {
+    background: #3b82f6; border-color: #3b82f6; color: #ffffff;
+}
+QPushButton#StatusChipAll {
+    background: transparent; border: 1px solid #e3e6ec; border-radius: 12px;
+    padding: 3px 10px; font-size: 11px; color: #8a92a3;
+}
+QPushButton#StatusChipAll:hover { color: #1f2330; background: #eef1f6; }
+
+#LatestBadge {
+    background: #fef3c7; color: #b45309; border-radius: 6px;
+    padding: 1px 6px; font-size: 9.5px; font-weight: 800;
+    letter-spacing: 0.5px;
+}
 """
 
 _DARK = """
@@ -288,6 +330,25 @@ QScrollBar::handle:vertical { background: #3a4455; border-radius: 5px; min-heigh
 QScrollBar::handle:vertical:hover { background: #4d5768; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+#AIBadgeOn { background: #10331d; color: #86efac; border-radius: 8px;
+    padding: 2px 8px; font-size: 10px; font-weight: 700; letter-spacing: .5px;
+    margin: 8px; }
+#AIBadgeOff { background: #3d1a1f; color: #fca5a5; border-radius: 8px;
+    padding: 2px 8px; font-size: 10px; font-weight: 700; letter-spacing: .5px;
+    margin: 8px; }
+
+#ChatPanel { background: #161a21; }
+#ChatPanel QTextBrowser { background: #0f1115; border: 1px solid #262d3a;
+    border-radius: 8px; padding: 8px; color: #e6e9ef; }
+#ChatPanel QPlainTextEdit { background: #1a1f28; border: 1px solid #262d3a;
+    border-radius: 8px; padding: 8px; color: #e6e9ef; }
+#ChatPanel QPlainTextEdit:focus { border-color: #7aa2f7; }
+
+#FloatButton { background: #7aa2f7; color: #0f1115; border-radius: 26px;
+    border: none; font-size: 16px; font-weight: 700; }
+#FloatButton:hover { background: #9ab8fa; }
+#FloatButton:pressed { background: #5a86f0; }
+
 """
 
 

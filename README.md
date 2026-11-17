@@ -1,57 +1,73 @@
 # aek
 
-A native desktop app for keeping track of every project on your machine.
-Stop re-discovering your own folders every time you try to resume something
-you started months ago.
+A native PyQt6 desktop app for organizing, understanding, and working with
+every project on your machine — with a local-first AI agent that reads what
+you allow it to read.
 
-Built with Python and PyQt6. Runs on Linux. No web layer, no browser, no cloud.
-
----
-
-## Features
-
-- **Card grid** — every project is a card with a cover image, name, folder path,
-  description, tags, category stripe and a status pill.
-- **Click to open** — click a card to open its folder. Buttons for a terminal
-  inside the project and for opening it in your code editor.
-- **Categories and groups** — free-text category per project. Use `/` to nest
-  (`AI/Vision`). The sidebar shows a tree. A separate "Groups" dialog lets you
-  create, rename, recolor and delete groups at any time; renaming a group
-  cascades to every project that uses it.
-- **Grouping view** — group cards by category or status, or keep them flat.
-- **Sort modes** — custom (drag order) · name · recently opened · recently added ·
-  status.
-- **Recent bar** — a horizontal strip of the last 8 opened projects, always
-  visible above the grid.
-- **Sidebar filters** — All · Favorites · Recently opened · Uncategorized ·
-  every category (nested).
-- **Search** — free text plus operators: `cat:web`, `tag:ai`, `status:paused`.
-- **Statistics dialog** — project counts by status and category, with on-demand
-  disk usage per category.
-- **Export / import** — full JSON snapshot including cover images (base64).
-  Merge or replace.
-- **System tray** — right-click for quick access to recent projects, rescan,
-  show and quit. The app keeps running in the tray when you close the window.
-- **Theme toggle** — light and dark themes, applied with a smooth crossfade and
-  persisted across restarts.
-- **Animations** — staggered card fade-in, animated toasts, smooth theme
-  transitions, hover states.
-- **Cover images** — pick one manually, or let aek auto-detect `cover.png`,
-  `screenshot.png`, `preview.jpg`, `logo.png` inside a project.
-- **Missing-folder badge** — a card whose path no longer exists shows a red
-  `MISSING` badge and warns before opening.
-- **Remarks** — a free-text “where I left off” field per project, so future-you
-  knows what past-you was doing.
-- **Everything local** — a single SQLite file plus a covers directory under
-  `~/.aek/data/`. No telemetry, no accounts.
-
-Removing a card never touches files on disk.
+![Python](https://img.shields.io/badge/python-3.10+-blue)
+![PyQt6](https://img.shields.io/badge/PyQt6-6.5+-green)
+![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-yellow)
 
 ---
+
+## The problem
+
+Over years of research and side projects, ~/Code fills with folders. Some are
+innovative. Some are abandoned mid-flight. Resuming one means re-reading it
+folder by folder.
+
+`aek` gives every project a card with a cover, a description, notes, a
+category, a status, and — if you allow it — an AI that can read the code and
+talk to you about it.
+
+## What it does
+
+### Personal project hub
+- **Card grid** — cover image, name, path, description, tags, category stripe,
+  status pill, favorite star, missing-folder warning
+- **Details view** — click any card for a full view with all metadata,
+  custom fields, and one-click actions
+- **Categories and groups** — free-text with `/` nesting (`AI/Vision`),
+  managed from a dedicated dialog
+- **Configurable statuses** — active / idea / paused / done / archived, plus
+  any you add
+- **Custom fields** — text, multiline, choice, or URL. Define them once, fill
+  them per project
+- **Zoom** — four card sizes from toolbar or `Ctrl+=` / `Ctrl+-`
+- **Search** — free text plus operators: `cat:web`, `tag:ai`, `status:paused`
+- **Recent bar** — last 8 opened projects, always one click away
+- **Sort modes** — custom drag order, name, recent, added, status
+- **Grouping** — flat, by category, or by status
+- **Snapshot export / import** — full JSON including cover images
+- **Statistics** — counts by status and category, with disk usage
+- **System tray** — quick access to recent projects
+
+### AI agent (opt-in per project)
+- **Review any project** — click AI review, edit the prompt, get a structured
+  response with suggested description, remarks, tags, and a full `AI_README.md`
+- **Chat with your library** — global or per-project; the agent reads through
+  tools you control
+- **Persistent chats** — resumes across restarts, with rolling summaries
+- **Agentic tools** — list projects, read files, search code, read git log,
+  update metadata, create reminders
+- **Privilege system** — every tool is toggleable in Settings → Privileges
+- **Sensitivity model** — per-project AI access flag plus a file picker that
+  marks folders or files as invisible
+- **Prompt files** — `user_profile.md` (you + AI) and `system_prompt.md`
+  (you only), both editable in-app or in your system editor
+- **Fallback chain** — tries models in your trust list, prefers free models
+  when asked, handles 402 credit errors gracefully
+- **Audit trail** — every read the agent makes is logged
+
+### Notifications
+- **Reminders** — per project, with due date and advance warning
+- **In-app toasts** plus optional system-tray notifications
 
 ## Install
 
 ```bash
-git clone https://github.com/<you>/aek.git
-cd aek
+git clone https://github.com/dynaio/project-hub.git
+cd project-hub
 ./install.sh
+aek

@@ -5,23 +5,9 @@ from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
 
 
 def make_icon(size: int = 64) -> QIcon:
-    pix = QPixmap(size, size)
-    pix.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    grad = QLinearGradient(0, 0, size, size)
-    grad.setColorAt(0.0, QColor("#3b82f6"))
-    grad.setColorAt(1.0, QColor("#8b5cf6"))
-    p.setBrush(grad)
-    p.setPen(Qt.PenStyle.NoPen)
-    radius = size // 4
-    p.drawRoundedRect(0, 0, size, size, radius, radius)
-    p.setPen(QColor("#ffffff"))
-    f = QFont("Ubuntu Sans", int(size * 0.42), QFont.Weight.Bold)
-    p.setFont(f)
-    p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "aek")
-    p.end()
-    return QIcon(pix)
+    """Delegates to aek.logo.get_icon(). Kept as a name for compatibility."""
+    from .logo import get_icon
+    return get_icon()
 
 
 class AekTray(QSystemTrayIcon):

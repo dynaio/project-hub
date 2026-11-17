@@ -11,6 +11,36 @@ from PyQt6.QtWidgets import (
 from .categories import color_for
 from .config import COVERS_DIR, CARD_SIZES
 
+# ---- cover pixmap cache -----------------------------------------------------
+# Keyed by (path, mtime, target_w, target_h). Bounded to ~200 entries.
+_COVER_CACHE = {}
+_COVER_CACHE_MAX = 200
+
+
+def _cached_cover(fp, w, h):
+    try:
+        mtime = fp.stat().st_mtime
+    except OSError:
+        return None
+    key = (str(fp), mtime, int(w), int(h))
+    hit = _COVER_CACHE.get(key)
+    if hit is not None or key in _COVER_CACHE:
+        return hit
+    pix = QPixmap(str(fp))
+    if pix.isNull():
+        _COVER_CACHE[key] = None
+        return None
+    scaled = pix.scaled(
+        int(w), int(h),
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    _COVER_CACHE[key] = scaled
+    if len(_COVER_CACHE) > _COVER_CACHE_MAX:
+        for k in list(_COVER_CACHE.keys())[:_COVER_CACHE_MAX // 3]:
+            _COVER_CACHE.pop(k, None)
+    return scaled
+
 
 # ------------------------------------------------------------ FlowContainer
 class FlowContainer(QWidget):
@@ -108,6 +138,13 @@ class ProjectCard(QFrame):
         del_btn.clicked.connect(lambda: self.delete_requested.emit(self.project["id"]))
         g.addWidget(del_btn, 0, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
 
+        # AI visibility badge
+        ai_lbl = QLabel("AI" if self.project.get("ai_visible") else "\U0001F512".replace("\U0001F512","L"))
+        ai_lbl.setObjectName("AIBadgeOn" if self.project.get("ai_visible") else "AIBadgeOff")
+        ai_lbl.setToolTip("AI can read this project" if self.project.get("ai_visible")
+                          else "Marked sensitive — AI cannot read this project")
+        g.addWidget(ai_lbl, 0, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+
         status = QLabel((self.project.get("status") or "active").upper())
         status.setObjectName(f"Status_{self.project.get('status', 'active')}")
         g.addWidget(status, 0, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
@@ -174,6 +211,13 @@ class ProjectCard(QFrame):
         outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
         outer.addWidget(cover); outer.addWidget(body, 1)
 
+    def _refresh_latest(self):
+        """Update just the LATEST badge visibility without a full rebuild."""
+        badge = getattr(self, "_latest_badge", None)
+        if badge is None:
+            return
+        badge.setVisible(bool(self.project.get("_is_latest")))
+
     def _short_path(self):
         p = str(self.project.get("path", ""))
         home = str(Path.home())
@@ -195,14 +239,7 @@ class ProjectCard(QFrame):
         fp = COVERS_DIR / Path(cov).name
         if not fp.exists():
             return None
-        pix = QPixmap(str(fp))
-        if pix.isNull():
-            return None
-        return pix.scaled(
-            self.W, self.COVER_H,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        return _cached_cover(fp, self.W, self.COVER_H)
 
     # mouse / drag
     def mousePressEvent(self, e):
